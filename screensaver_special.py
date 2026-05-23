@@ -24,8 +24,8 @@ class AppConfig:
     screensaver_image: str = "C:/LaciABC/laci_abc_sotet_hatter.png"
     target_monitor_index: int = 0
     idle_seconds: float = 60.0
-    check_interval: float = 0.25
-    change_threshold: float = 3.0
+    check_interval: float = 0.5
+    change_threshold: float = 0.03
     visible_after_change_seconds: float = 2.0
     start_minimized: bool = False
     auto_start_monitoring: bool = False
@@ -99,38 +99,20 @@ def capture_printwindow(hwnd: int) -> Optional[Image.Image]:
             return None
         bmpinfo = bitmap.GetInfo()
         bmpstr = bitmap.GetBitmapBits(True)
-        return Image.frombuffer(
-            "RGB",
-            (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
-            bmpstr,
-            "raw",
-            "BGRX",
-            0,
-            1,
-        )
+        return Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]), bmpstr, "raw", "BGRX", 0, 1)
     except Exception:
         return None
     finally:
-        try:
-            if bitmap is not None:
-                win32gui.DeleteObject(bitmap.GetHandle())
-        except Exception:
-            pass
-        try:
-            if save_dc is not None:
-                save_dc.DeleteDC()
-        except Exception:
-            pass
-        try:
-            if mfc_dc is not None:
-                mfc_dc.DeleteDC()
-        except Exception:
-            pass
-        try:
-            if hwnd_dc is not None:
-                win32gui.ReleaseDC(hwnd, hwnd_dc)
-        except Exception:
-            pass
+        for cleanup in (
+            lambda: win32gui.DeleteObject(bitmap.GetHandle()) if bitmap is not None else None,
+            lambda: save_dc.DeleteDC() if save_dc is not None else None,
+            lambda: mfc_dc.DeleteDC() if mfc_dc is not None else None,
+            lambda: win32gui.ReleaseDC(hwnd, hwnd_dc) if hwnd_dc is not None else None,
+        ):
+            try:
+                cleanup()
+            except Exception:
+                pass
 
 
 def capture_visible(hwnd: int) -> Optional[Image.Image]:
@@ -143,19 +125,26 @@ def capture_visible(hwnd: int) -> Optional[Image.Image]:
         return None
 
 
-def capture_window(hwnd: int, visible_first: bool) -> Tuple[Optional[Image.Image], str]:
-    if visible_first:
-        image = capture_visible(hwnd)
-        if image is not None:
-            return image, "visible-screen"
-        image = capture_printwindow(hwnd)
-        return image, "printwindow-fallback"
+def capture_window(hwnd: int, visible_first: bool, overlay_visible: bool) -> Tuple[Optional[Image.Image], str]:
+    # Important: when the logo is visible, do NOT use visible-screen capture.
+    # Otherwise the program only sees its own logo, not the cashier program.
+    # PrintWindow can read many normal Windows apps behind the overlay without flicker.
+    if overlay_visible:
+        img = capture_printwindow(hwnd)
+        return img, "printwindow-behind-logo"
 
-    image = capture_printwindow(hwnd)
-    if image is not None:
-        return image, "printwindow"
-    image = capture_visible(hwnd)
-    return image, "visible-fallback"
+    if visible_first:
+        img = capture_visible(hwnd)
+        if img is not None:
+            return img, "visible-screen"
+        img = capture_printwindow(hwnd)
+        return img, "printwindow-fallback"
+
+    img = capture_printwindow(hwnd)
+    if img is not None:
+        return img, "printwindow"
+    img = capture_visible(hwnd)
+    return img, "visible-fallback"
 
 
 def diff_score(a: Image.Image, b: Image.Image) -> float:
@@ -240,8 +229,6 @@ class App:
         self.worker: Optional[threading.Thread] = None
         self.monitoring = False
         self.test_overlay_active = False
-        self.overlay_shown_at = 0.0
-        self.ignore_first_overlay_change = False
         self.window_items: List[Tuple[int, str]] = []
         self.monitor_items = []
         self.status_var = tk.StringVar(value="Kész")
@@ -253,23 +240,6 @@ class App:
             self.root.iconify()
         if self.config.auto_start_monitoring:
             self.root.after(500, self.start_monitoring)
-
-    def run_on_ui_thread(self, func, *args, timeout: float = 1.0) -> None:
-        done = threading.Event()
-        error = []
-
-        def wrapper():
-            try:
-                func(*args)
-            except Exception as exc:
-                error.append(exc)
-            finally:
-                done.set()
-
-        self.root.after(0, wrapper)
-        done.wait(timeout)
-        if error:
-            raise error[0]
 
     def build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
@@ -306,8 +276,8 @@ class App:
         self.threshold_var = tk.StringVar()
         self.visible_after_var = tk.StringVar()
         self.add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Teszteléshez állítsd 5-re.")
-        self.add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "0.25 = kb. negyed másodperces reakció.")
-        self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Javasolt: 0.01-0.10 VirtualBox tesztnél, 2-5 valódi ablaknál.")
+        self.add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "0.5 vagy 1.0 ajánlott.")
+        self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "0.01-0.10 VirtualBox tesztnél, 2-5 valódi ablaknál.")
         self.add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Változás után legalább ennyi ideig maradjon látható a kassza.")
 
         options = ttk.LabelFrame(main, text="Indítás", padding=10)
@@ -317,7 +287,7 @@ class App:
         self.fallback_var = tk.BooleanVar()
         ttk.Checkbutton(options, text="Indításkor kis méretben induljon", variable=self.start_minimized_var).pack(anchor="w")
         ttk.Checkbutton(options, text="Program indításakor automatikusan induljon a figyelés", variable=self.auto_start_var).pack(anchor="w")
-        ttk.Checkbutton(options, text="Látható képernyőrész figyelése elsődlegesen (VirtualBoxhoz ajánlott)", variable=self.fallback_var).pack(anchor="w")
+        ttk.Checkbutton(options, text="Látható képernyőrész figyelése elsődlegesen, amíg a logó nem látszik", variable=self.fallback_var).pack(anchor="w")
 
         buttons = ttk.Frame(main)
         buttons.pack(fill="x", pady=12)
@@ -436,7 +406,7 @@ class App:
         if hwnd is None:
             self.log_message("Capture teszt: nincs kiválasztott/megtalált ablak")
             return
-        img, mode = capture_window(hwnd, self.config.use_visible_screen_fallback)
+        img, mode = capture_window(hwnd, self.config.use_visible_screen_fallback, self.overlay.visible)
         if img is None:
             self.log_message("Capture teszt sikertelen: az ablak képe nem olvasható")
         else:
@@ -472,8 +442,6 @@ class App:
         self.stop_event.clear()
         self.monitoring = True
         self.test_overlay_active = False
-        self.overlay_shown_at = 0.0
-        self.ignore_first_overlay_change = False
         self.worker = threading.Thread(target=self.monitor_loop, daemon=True)
         self.worker.start()
         self.log_message("Monitorozás elindítva")
@@ -485,22 +453,6 @@ class App:
         self.overlay.hide()
         self.log_message("Monitorozás leállítva")
 
-    def show_overlay_from_monitoring(self) -> None:
-        if self.test_overlay_active:
-            return
-        if not self.overlay.visible:
-            self.overlay.show(self.config.screensaver_image, self.config.target_monitor_index)
-            self.overlay_shown_at = time.time()
-            self.ignore_first_overlay_change = True
-
-    def capture_for_monitoring(self, hwnd: int) -> Tuple[Optional[Image.Image], str]:
-        if self.overlay.visible and self.config.use_visible_screen_fallback:
-            self.run_on_ui_thread(self.overlay.hide)
-            time.sleep(0.08)
-            image, mode = capture_window(hwnd, True)
-            return image, f"{mode}-behind-overlay"
-        return capture_window(hwnd, self.config.use_visible_screen_fallback)
-
     def monitor_loop(self) -> None:
         hwnd: Optional[int] = None
         previous_img: Optional[Image.Image] = None
@@ -509,7 +461,6 @@ class App:
         last_capture_fail_log = 0.0
         last_wait_log = 0.0
         last_score_log = 0.0
-        last_overlay_sample_log = 0.0
         overlay_logged = False
 
         while not self.stop_event.is_set():
@@ -532,13 +483,13 @@ class App:
                         continue
                     self.root.after(0, self.log_message, f"Figyelt ablak: {win32gui.GetWindowText(hwnd)}")
 
-                was_overlay_visible = self.overlay.visible
-                current_img, mode = self.capture_for_monitoring(hwnd)
+                current_img, mode = capture_window(hwnd, self.config.use_visible_screen_fallback, self.overlay.visible)
                 if current_img is None:
                     if time.time() - last_capture_fail_log > 5:
                         self.root.after(0, self.log_message, "Capture sikertelen: nincs olvasható ablak-kép")
                         last_capture_fail_log = time.time()
-                    self.root.after(0, self.overlay.hide)
+                    if self.overlay.visible:
+                        self.root.after(0, self.log_message, "A logó mögötti változás nem olvasható villogásmentesen ennél az ablaknál")
                     time.sleep(1)
                     continue
 
@@ -558,21 +509,14 @@ class App:
                     previous_img = current_img
                     last_change_time = time.time()
                     overlay_logged = False
-                    self.ignore_first_overlay_change = False
                     self.root.after(0, self.overlay.hide)
                 else:
                     idle_time = time.time() - last_change_time
-                    if was_overlay_visible:
-                        self.root.after(0, self.show_overlay_from_monitoring)
-                        if time.time() - last_overlay_sample_log > 10:
-                            self.root.after(0, self.log_message, "Overlay mögötti mintavétel: nincs változás, kép marad")
-                            last_overlay_sample_log = time.time()
-                    elif time.time() - last_wait_log > 10 and idle_time < self.config.idle_seconds:
+                    if not self.overlay.visible and time.time() - last_wait_log > 10 and idle_time < self.config.idle_seconds:
                         self.root.after(0, self.log_message, f"Tétlen: {idle_time:.0f}/{self.config.idle_seconds:.0f} mp")
                         last_wait_log = time.time()
-
-                    if idle_time >= self.config.idle_seconds:
-                        self.root.after(0, self.show_overlay_from_monitoring)
+                    if idle_time >= self.config.idle_seconds and not self.overlay.visible:
+                        self.root.after(0, self.overlay.show, self.config.screensaver_image, self.config.target_monitor_index)
                         if not overlay_logged:
                             self.root.after(0, self.log_message, "Tétlenségi idő letelt, kép megjelenítése")
                             overlay_logged = True
