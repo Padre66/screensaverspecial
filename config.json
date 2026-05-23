@@ -1,0 +1,12 @@
+{
+  "cashier_window_title_part": "Oracle VirtualBox Kezelő",
+  "screensaver_image": "C:/Users/David/Downloads/unnamed.png",
+  "target_monitor_index": 1,
+  "idle_seconds": 60.0,
+  "check_interval": 0.25,
+  "change_threshold": 0.05,
+  "visible_after_change_seconds": 2.0,
+  "start_minimized": false,
+  "auto_start_monitoring": true,
+  "use_visible_screen_fallback": true
+}
