@@ -11,7 +11,6 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from screeninfo import get_monitors
 
-import win32con
 import win32gui
 import win32ui
 
@@ -37,11 +36,11 @@ def load_config() -> AppConfig:
         return AppConfig()
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        base = AppConfig()
+        config = AppConfig()
         for key, value in data.items():
-            if hasattr(base, key):
-                setattr(base, key, value)
-        return base
+            if hasattr(config, key):
+                setattr(config, key, value)
+        return config
     except Exception:
         return AppConfig()
 
@@ -57,11 +56,8 @@ def list_windows() -> List[Tuple[int, str]]:
         if not win32gui.IsWindowVisible(hwnd):
             return
         title = win32gui.GetWindowText(hwnd).strip()
-        if not title:
-            return
-        if title in {APP_TITLE, "Program Manager"}:
-            return
-        windows.append((hwnd, title))
+        if title and title not in {APP_TITLE, "Program Manager"}:
+            windows.append((hwnd, title))
 
     win32gui.EnumWindows(callback, None)
     windows.sort(key=lambda item: item[1].lower())
@@ -79,6 +75,10 @@ def find_window_by_title_part(title_part: str) -> Optional[int]:
 
 
 def capture_window(hwnd: int) -> Optional[Image.Image]:
+    hwnd_dc = None
+    mfc_dc = None
+    save_dc = None
+    bitmap = None
     try:
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         width = right - left
@@ -101,7 +101,7 @@ def capture_window(hwnd: int) -> Optional[Image.Image]:
 
         bmpinfo = bitmap.GetInfo()
         bmpstr = bitmap.GetBitmapBits(True)
-        image = Image.frombuffer(
+        return Image.frombuffer(
             "RGB",
             (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
             bmpstr,
@@ -110,24 +110,27 @@ def capture_window(hwnd: int) -> Optional[Image.Image]:
             0,
             1,
         )
-        return image
     except Exception:
         return None
     finally:
         try:
-            win32gui.DeleteObject(bitmap.GetHandle())
+            if bitmap is not None:
+                win32gui.DeleteObject(bitmap.GetHandle())
         except Exception:
             pass
         try:
-            save_dc.DeleteDC()
+            if save_dc is not None:
+                save_dc.DeleteDC()
         except Exception:
             pass
         try:
-            mfc_dc.DeleteDC()
+            if mfc_dc is not None:
+                mfc_dc.DeleteDC()
         except Exception:
             pass
         try:
-            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            if hwnd_dc is not None:
+                win32gui.ReleaseDC(hwnd, hwnd_dc)
         except Exception:
             pass
 
@@ -141,8 +144,9 @@ def image_difference_score(img1: Image.Image, img2: Image.Image) -> float:
 
 
 class Overlay:
-    def __init__(self, parent: tk.Tk):
+    def __init__(self, parent: tk.Tk, on_manual_hide=None):
         self.parent = parent
+        self.on_manual_hide = on_manual_hide
         self.window: Optional[tk.Toplevel] = None
         self.label: Optional[tk.Label] = None
         self.photo = None
@@ -161,6 +165,12 @@ class Overlay:
             self.window.configure(bg="black")
             self.label = tk.Label(self.window, bg="black")
             self.label.pack(fill="both", expand=True)
+            self.window.bind("<Escape>", self.manual_hide)
+            self.window.bind("<Button-1>", self.manual_hide)
+            self.window.bind("<Button-3>", self.manual_hide)
+            self.label.bind("<Escape>", self.manual_hide)
+            self.label.bind("<Button-1>", self.manual_hide)
+            self.label.bind("<Button-3>", self.manual_hide)
             self.window.withdraw()
 
         self.window.geometry(f"{monitor.width}x{monitor.height}+{monitor.x}+{monitor.y}")
@@ -170,7 +180,13 @@ class Overlay:
         self.label.configure(image=self.photo)
         self.window.deiconify()
         self.window.lift()
+        self.window.focus_force()
         self.visible = True
+
+    def manual_hide(self, event=None) -> None:
+        self.hide()
+        if self.on_manual_hide is not None:
+            self.on_manual_hide()
 
     def hide(self) -> None:
         if self.window is not None:
@@ -201,10 +217,11 @@ class ScreenSaverSpecialApp:
         self.root.minsize(720, 560)
 
         self.config = load_config()
-        self.overlay = Overlay(root)
+        self.overlay = Overlay(root, self.on_overlay_manual_hide)
         self.worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.monitoring = False
+        self.test_overlay_active = False
         self.status_var = tk.StringVar(value="Kész")
         self.window_items: List[Tuple[int, str]] = []
         self.monitor_items = []
@@ -223,12 +240,10 @@ class ScreenSaverSpecialApp:
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
 
-        title = ttk.Label(main, text="ScreenSaver Special - kassza kijelzővédő", font=("Segoe UI", 14, "bold"))
-        title.pack(anchor="w", pady=(0, 10))
+        ttk.Label(main, text="ScreenSaver Special - kassza kijelzővédő", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
 
         settings = ttk.LabelFrame(main, text="Beállítások", padding=10)
         settings.pack(fill="x")
-
         self.window_combo = ttk.Combobox(settings, state="readonly", width=70)
         self.window_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
         ttk.Label(settings, text="Kasszaprogram ablaka:").grid(row=0, column=0, sticky="w", pady=4)
@@ -248,19 +263,19 @@ class ScreenSaverSpecialApp:
         self.monitor_combo = ttk.Combobox(settings, state="readonly", width=70)
         self.monitor_combo.grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
         ttk.Button(settings, text="Frissítés", command=self.refresh_monitors).grid(row=3, column=3, sticky="ew", padx=4)
+        settings.columnconfigure(1, weight=1)
 
         numeric = ttk.LabelFrame(main, text="Időzítés és érzékenység", padding=10)
         numeric.pack(fill="x", pady=10)
-
         self.idle_var = tk.StringVar()
         self.interval_var = tk.StringVar()
         self.threshold_var = tk.StringVar()
         self.visible_after_var = tk.StringVar()
-
         self._add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Ennyi változatlan idő után jelenik meg a kép.")
         self._add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "0.25 = kb. negyed másodperces reakció.")
         self._add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Kisebb érték = érzékenyebb. Javasolt: 2-5.")
         self._add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Változás után legalább ennyi ideig maradjon látható a kassza.")
+        numeric.columnconfigure(1, weight=1)
 
         options = ttk.LabelFrame(main, text="Indítás", padding=10)
         options.pack(fill="x")
@@ -273,7 +288,7 @@ class ScreenSaverSpecialApp:
         buttons.pack(fill="x", pady=12)
         ttk.Button(buttons, text="Mentés", command=self.save_from_ui).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Teszt kép mutatása", command=self.test_show_overlay).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Teszt kép elrejtése", command=self.overlay.hide).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Teszt kép elrejtése", command=self.hide_test_overlay).pack(side="left", padx=6)
         ttk.Button(buttons, text="Start monitorozás", command=self.start_monitoring).pack(side="right", padx=6)
         ttk.Button(buttons, text="Stop", command=self.stop_monitoring).pack(side="right", padx=6)
 
@@ -282,12 +297,7 @@ class ScreenSaverSpecialApp:
         self.log = tk.Text(log_box, height=8, wrap="word")
         self.log.pack(fill="both", expand=True)
         self.log.configure(state="disabled")
-
-        status = ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=6)
-        status.pack(side="bottom", fill="x")
-
-        settings.columnconfigure(1, weight=1)
-        numeric.columnconfigure(1, weight=1)
+        ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=6).pack(side="bottom", fill="x")
 
     def _add_number_row(self, parent, row: int, label: str, var: tk.StringVar, hint: str) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
@@ -304,8 +314,7 @@ class ScreenSaverSpecialApp:
         self.start_minimized_var.set(self.config.start_minimized)
         self.auto_start_var.set(self.config.auto_start_monitoring)
         if self.monitor_items:
-            idx = min(max(self.config.target_monitor_index, 0), len(self.monitor_items) - 1)
-            self.monitor_combo.current(idx)
+            self.monitor_combo.current(min(max(self.config.target_monitor_index, 0), len(self.monitor_items) - 1))
 
     def log_message(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -324,23 +333,17 @@ class ScreenSaverSpecialApp:
         self.log_message(f"Ablaklista frissítve: {len(values)} ablak")
 
     def refresh_monitors(self) -> None:
-        monitors = get_monitors()
-        self.monitor_items = monitors
-        values = []
-        for i, monitor in enumerate(monitors):
-            values.append(f"{i}: {monitor.width}x{monitor.height}  pozíció: {monitor.x},{monitor.y}")
+        self.monitor_items = get_monitors()
+        values = [f"{i}: {m.width}x{m.height} pozíció: {m.x},{m.y}" for i, m in enumerate(self.monitor_items)]
         self.monitor_combo["values"] = values
         if values:
-            idx = min(max(int(self.config.target_monitor_index), 0), len(values) - 1)
-            self.monitor_combo.current(idx)
+            self.monitor_combo.current(min(max(int(self.config.target_monitor_index), 0), len(values) - 1))
         self.log_message(f"Monitorlista frissítve: {len(values)} monitor")
 
     def use_selected_window_title(self) -> None:
         idx = self.window_combo.current()
-        if idx < 0 or idx >= len(self.window_items):
-            return
-        _, title = self.window_items[idx]
-        self.title_part_var.set(title)
+        if 0 <= idx < len(self.window_items):
+            self.title_part_var.set(self.window_items[idx][1])
 
     def browse_image(self) -> None:
         filename = filedialog.askopenfilename(
@@ -389,16 +392,29 @@ class ScreenSaverSpecialApp:
         if not self.save_from_ui():
             return
         try:
+            self.test_overlay_active = True
             self.overlay.show(self.config.screensaver_image, self.config.target_monitor_index)
-            self.log_message("Teszt kép megjelenítve")
+            self.log_message("Teszt kép megjelenítve. Elrejtés: ESC vagy egérkattintás a képen.")
         except Exception as exc:
+            self.test_overlay_active = False
             messagebox.showerror(APP_TITLE, str(exc))
+
+    def hide_test_overlay(self) -> None:
+        self.test_overlay_active = False
+        self.overlay.hide()
+        self.log_message("Teszt kép elrejtve")
+
+    def on_overlay_manual_hide(self) -> None:
+        if self.test_overlay_active:
+            self.test_overlay_active = False
+            self.log_message("Teszt kép elrejtve")
 
     def start_monitoring(self) -> None:
         if self.monitoring:
             return
         if not self.save_from_ui():
             return
+        self.test_overlay_active = False
         self.stop_event.clear()
         self.worker = threading.Thread(target=self._monitor_loop, daemon=True)
         self.worker.start()
@@ -408,6 +424,7 @@ class ScreenSaverSpecialApp:
     def stop_monitoring(self) -> None:
         self.stop_event.set()
         self.monitoring = False
+        self.test_overlay_active = False
         self.root.after(0, self.overlay.hide)
         self.log_message("Monitorozás leállítva")
 
@@ -419,6 +436,10 @@ class ScreenSaverSpecialApp:
 
         while not self.stop_event.is_set():
             try:
+                if self.test_overlay_active:
+                    time.sleep(0.1)
+                    continue
+
                 if hwnd is None or not win32gui.IsWindow(hwnd):
                     hwnd = find_window_by_title_part(self.config.cashier_window_title_part)
                     previous_img = None
@@ -467,6 +488,8 @@ class ScreenSaverSpecialApp:
         self.root.after(0, self.overlay.hide)
 
     def _safe_show_overlay(self) -> None:
+        if self.test_overlay_active:
+            return
         try:
             self.overlay.show(self.config.screensaver_image, self.config.target_monitor_index)
         except Exception as exc:
