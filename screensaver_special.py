@@ -143,13 +143,21 @@ def capture_visible(hwnd: int) -> Optional[Image.Image]:
         return None
 
 
-def capture_window(hwnd: int, fallback: bool) -> Optional[Image.Image]:
+def capture_window(hwnd: int, visible_first: bool) -> Tuple[Optional[Image.Image], str]:
+    # VirtualBox and some GPU-rendered apps return a valid but stale image through PrintWindow.
+    # When the checkbox is enabled, use the actually visible screen pixels first.
+    if visible_first:
+        image = capture_visible(hwnd)
+        if image is not None:
+            return image, "visible-screen"
+        image = capture_printwindow(hwnd)
+        return image, "printwindow-fallback"
+
     image = capture_printwindow(hwnd)
     if image is not None:
-        return image
-    if fallback:
-        return capture_visible(hwnd)
-    return None
+        return image, "printwindow"
+    image = capture_visible(hwnd)
+    return image, "visible-fallback"
 
 
 def diff_score(a: Image.Image, b: Image.Image) -> float:
@@ -226,8 +234,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("820x680")
-        self.root.minsize(780, 620)
+        self.root.geometry("840x700")
+        self.root.minsize(800, 640)
         self.config = load_config()
         self.overlay = Overlay(root, self.on_overlay_manual_hide)
         self.stop_event = threading.Event()
@@ -252,6 +260,7 @@ class App:
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
         ttk.Label(main, text="ScreenSaver Special - kassza kijelzővédő", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
+
         settings = ttk.LabelFrame(main, text="Beállítások", padding=10)
         settings.pack(fill="x")
         ttk.Label(settings, text="Kasszaprogram ablaka:").grid(row=0, column=0, sticky="w", pady=4)
@@ -259,13 +268,16 @@ class App:
         self.window_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
         ttk.Button(settings, text="Frissítés", command=self.refresh_windows).grid(row=0, column=2, padx=4)
         ttk.Button(settings, text="Cím átvétele", command=self.use_selected_window_title).grid(row=0, column=3, padx=4)
+
         ttk.Label(settings, text="Ablakcím részlete:").grid(row=1, column=0, sticky="w", pady=4)
         self.title_part_var = tk.StringVar()
         ttk.Entry(settings, textvariable=self.title_part_var).grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
+
         ttk.Label(settings, text="Kijelzővédő kép:").grid(row=2, column=0, sticky="w", pady=4)
         self.image_var = tk.StringVar()
         ttk.Entry(settings, textvariable=self.image_var).grid(row=2, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
         ttk.Button(settings, text="Tallózás", command=self.browse_image).grid(row=2, column=3, padx=4)
+
         ttk.Label(settings, text="Cél monitor:").grid(row=3, column=0, sticky="w", pady=4)
         self.monitor_combo = ttk.Combobox(settings, state="readonly", width=70)
         self.monitor_combo.grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
@@ -280,7 +292,7 @@ class App:
         self.visible_after_var = tk.StringVar()
         self.add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Teszteléshez állítsd 5-re.")
         self.add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "0.25 = kb. negyed másodperces reakció.")
-        self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Javasolt: 2-5.")
+        self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Javasolt: 2-5. A log kiírja a mért értéket.")
         self.add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Változás után legalább ennyi ideig maradjon látható a kassza.")
 
         options = ttk.LabelFrame(main, text="Indítás", padding=10)
@@ -290,7 +302,7 @@ class App:
         self.fallback_var = tk.BooleanVar()
         ttk.Checkbutton(options, text="Indításkor kis méretben induljon", variable=self.start_minimized_var).pack(anchor="w")
         ttk.Checkbutton(options, text="Program indításakor automatikusan induljon a figyelés", variable=self.auto_start_var).pack(anchor="w")
-        ttk.Checkbutton(options, text="Látható képernyőrész figyelése, ha az ablak belső képe nem olvasható (VirtualBoxhoz ajánlott)", variable=self.fallback_var).pack(anchor="w")
+        ttk.Checkbutton(options, text="Látható képernyőrész figyelése elsődlegesen (VirtualBoxhoz ajánlott)", variable=self.fallback_var).pack(anchor="w")
 
         buttons = ttk.Frame(main)
         buttons.pack(fill="x", pady=12)
@@ -409,11 +421,11 @@ class App:
         if hwnd is None:
             self.log_message("Capture teszt: nincs kiválasztott/megtalált ablak")
             return
-        img = capture_window(hwnd, self.config.use_visible_screen_fallback)
+        img, mode = capture_window(hwnd, self.config.use_visible_screen_fallback)
         if img is None:
             self.log_message("Capture teszt sikertelen: az ablak képe nem olvasható")
         else:
-            self.log_message(f"Capture teszt sikeres: {img.width}x{img.height}")
+            self.log_message(f"Capture teszt sikeres: {img.width}x{img.height}, mód: {mode}")
 
     def test_show_overlay(self) -> None:
         if not self.save_from_ui():
@@ -473,6 +485,7 @@ class App:
         last_missing_log = 0.0
         last_capture_fail_log = 0.0
         last_wait_log = 0.0
+        last_score_log = 0.0
         overlay_logged = False
 
         while not self.stop_event.is_set():
@@ -495,7 +508,7 @@ class App:
                         continue
                     self.root.after(0, self.log_message, f"Figyelt ablak: {win32gui.GetWindowText(hwnd)}")
 
-                current_img = capture_window(hwnd, self.config.use_visible_screen_fallback)
+                current_img, mode = capture_window(hwnd, self.config.use_visible_screen_fallback)
                 if current_img is None:
                     if time.time() - last_capture_fail_log > 5:
                         self.root.after(0, self.log_message, "Capture sikertelen: nincs olvasható ablak-kép")
@@ -507,11 +520,15 @@ class App:
                 if previous_img is None:
                     previous_img = current_img
                     last_change_time = time.time()
-                    self.root.after(0, self.log_message, "Első képminta rögzítve, tétlenség mérése indul")
+                    self.root.after(0, self.log_message, f"Első képminta rögzítve, mód: {mode}")
                     time.sleep(self.config.check_interval)
                     continue
 
                 score = diff_score(previous_img, current_img)
+                if time.time() - last_score_log > 5:
+                    self.root.after(0, self.log_message, f"Aktuális eltérés: {score:.2f}, küszöb: {self.config.change_threshold:.2f}, mód: {mode}")
+                    last_score_log = time.time()
+
                 if score > self.config.change_threshold:
                     if self.overlay.visible and self.ignore_first_overlay_change:
                         previous_img = current_img
