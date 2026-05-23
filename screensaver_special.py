@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk
+from PIL import Image, ImageGrab, ImageTk
 from screeninfo import get_monitors
 
 import win32gui
@@ -29,6 +29,7 @@ class AppConfig:
     visible_after_change_seconds: float = 2.0
     start_minimized: bool = False
     auto_start_monitoring: bool = False
+    use_visible_screen_fallback: bool = True
 
 
 def load_config() -> AppConfig:
@@ -74,7 +75,7 @@ def find_window_by_title_part(title_part: str) -> Optional[int]:
     return None
 
 
-def capture_window(hwnd: int) -> Optional[Image.Image]:
+def capture_window_printwindow(hwnd: int) -> Optional[Image.Image]:
     hwnd_dc = None
     mfc_dc = None
     save_dc = None
@@ -135,6 +136,25 @@ def capture_window(hwnd: int) -> Optional[Image.Image]:
             pass
 
 
+def capture_window_visible_screen(hwnd: int) -> Optional[Image.Image]:
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        if right <= left or bottom <= top:
+            return None
+        return ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True).convert("RGB")
+    except Exception:
+        return None
+
+
+def capture_window(hwnd: int, use_visible_screen_fallback: bool = True) -> Optional[Image.Image]:
+    image = capture_window_printwindow(hwnd)
+    if image is not None:
+        return image
+    if use_visible_screen_fallback:
+        return capture_window_visible_screen(hwnd)
+    return None
+
+
 def image_difference_score(img1: Image.Image, img2: Image.Image) -> float:
     img1 = img1.resize((320, 180)).convert("L")
     img2 = img2.resize((320, 180)).convert("L")
@@ -165,12 +185,10 @@ class Overlay:
             self.window.configure(bg="black")
             self.label = tk.Label(self.window, bg="black")
             self.label.pack(fill="both", expand=True)
-            self.window.bind("<Escape>", self.manual_hide)
-            self.window.bind("<Button-1>", self.manual_hide)
-            self.window.bind("<Button-3>", self.manual_hide)
-            self.label.bind("<Escape>", self.manual_hide)
-            self.label.bind("<Button-1>", self.manual_hide)
-            self.label.bind("<Button-3>", self.manual_hide)
+            for widget in (self.window, self.label):
+                widget.bind("<Escape>", self.manual_hide)
+                widget.bind("<Button-1>", self.manual_hide)
+                widget.bind("<Button-3>", self.manual_hide)
             self.window.withdraw()
 
         self.window.geometry(f"{monitor.width}x{monitor.height}+{monitor.x}+{monitor.y}")
@@ -213,8 +231,8 @@ class ScreenSaverSpecialApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("760x620")
-        self.root.minsize(720, 560)
+        self.root.geometry("820x680")
+        self.root.minsize(780, 620)
 
         self.config = load_config()
         self.overlay = Overlay(root, self.on_overlay_manual_hide)
@@ -239,7 +257,6 @@ class ScreenSaverSpecialApp:
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
-
         ttk.Label(main, text="ScreenSaver Special - kassza kijelzővédő", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
 
         settings = ttk.LabelFrame(main, text="Beállítások", padding=10)
@@ -271,7 +288,7 @@ class ScreenSaverSpecialApp:
         self.interval_var = tk.StringVar()
         self.threshold_var = tk.StringVar()
         self.visible_after_var = tk.StringVar()
-        self._add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Ennyi változatlan idő után jelenik meg a kép.")
+        self._add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Teszteléshez állítsd 5-re.")
         self._add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "0.25 = kb. negyed másodperces reakció.")
         self._add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Kisebb érték = érzékenyebb. Javasolt: 2-5.")
         self._add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Változás után legalább ennyi ideig maradjon látható a kassza.")
@@ -281,20 +298,23 @@ class ScreenSaverSpecialApp:
         options.pack(fill="x")
         self.start_minimized_var = tk.BooleanVar()
         self.auto_start_var = tk.BooleanVar()
+        self.fallback_var = tk.BooleanVar()
         ttk.Checkbutton(options, text="Indításkor kis méretben induljon", variable=self.start_minimized_var).pack(anchor="w")
         ttk.Checkbutton(options, text="Program indításakor automatikusan induljon a figyelés", variable=self.auto_start_var).pack(anchor="w")
+        ttk.Checkbutton(options, text="Látható képernyőrész figyelése, ha az ablak belső képe nem olvasható (VirtualBoxhoz ajánlott)", variable=self.fallback_var).pack(anchor="w")
 
         buttons = ttk.Frame(main)
         buttons.pack(fill="x", pady=12)
         ttk.Button(buttons, text="Mentés", command=self.save_from_ui).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Teszt kép mutatása", command=self.test_show_overlay).pack(side="left", padx=6)
         ttk.Button(buttons, text="Teszt kép elrejtése", command=self.hide_test_overlay).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Capture teszt", command=self.capture_test).pack(side="left", padx=6)
         ttk.Button(buttons, text="Start monitorozás", command=self.start_monitoring).pack(side="right", padx=6)
         ttk.Button(buttons, text="Stop", command=self.stop_monitoring).pack(side="right", padx=6)
 
         log_box = ttk.LabelFrame(main, text="Állapot", padding=10)
         log_box.pack(fill="both", expand=True)
-        self.log = tk.Text(log_box, height=8, wrap="word")
+        self.log = tk.Text(log_box, height=10, wrap="word")
         self.log.pack(fill="both", expand=True)
         self.log.configure(state="disabled")
         ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=6).pack(side="bottom", fill="x")
@@ -313,6 +333,7 @@ class ScreenSaverSpecialApp:
         self.visible_after_var.set(str(self.config.visible_after_change_seconds))
         self.start_minimized_var.set(self.config.start_minimized)
         self.auto_start_var.set(self.config.auto_start_monitoring)
+        self.fallback_var.set(self.config.use_visible_screen_fallback)
         if self.monitor_items:
             self.monitor_combo.current(min(max(self.config.target_monitor_index, 0), len(self.monitor_items) - 1))
 
@@ -346,10 +367,7 @@ class ScreenSaverSpecialApp:
             self.title_part_var.set(self.window_items[idx][1])
 
     def browse_image(self) -> None:
-        filename = filedialog.askopenfilename(
-            title="Kijelzővédő kép kiválasztása",
-            filetypes=[("Képfájlok", "*.png;*.jpg;*.jpeg;*.bmp;*.webp"), ("Minden fájl", "*.*")],
-        )
+        filename = filedialog.askopenfilename(title="Kijelzővédő kép kiválasztása", filetypes=[("Képfájlok", "*.png;*.jpg;*.jpeg;*.bmp;*.webp"), ("Minden fájl", "*.*")])
         if filename:
             self.image_var.set(filename)
 
@@ -367,6 +385,7 @@ class ScreenSaverSpecialApp:
             visible_after_change_seconds=float(self.visible_after_var.get()),
             start_minimized=bool(self.start_minimized_var.get()),
             auto_start_monitoring=bool(self.auto_start_var.get()),
+            use_visible_screen_fallback=bool(self.fallback_var.get()),
         )
 
     def save_from_ui(self) -> bool:
@@ -387,6 +406,28 @@ class ScreenSaverSpecialApp:
         except Exception as exc:
             messagebox.showerror(APP_TITLE, str(exc))
             return False
+
+    def get_selected_hwnd(self) -> Optional[int]:
+        hwnd = find_window_by_title_part(self.title_part_var.get().strip())
+        if hwnd is not None:
+            return hwnd
+        idx = self.window_combo.current()
+        if 0 <= idx < len(self.window_items):
+            return self.window_items[idx][0]
+        return None
+
+    def capture_test(self) -> None:
+        if not self.save_from_ui():
+            return
+        hwnd = self.get_selected_hwnd()
+        if hwnd is None:
+            self.log_message("Capture teszt: nincs kiválasztott/megtalált ablak")
+            return
+        img = capture_window(hwnd, self.config.use_visible_screen_fallback)
+        if img is None:
+            self.log_message("Capture teszt sikertelen: az ablak képe nem olvasható")
+            return
+        self.log_message(f"Capture teszt sikeres: {img.width}x{img.height}")
 
     def test_show_overlay(self) -> None:
         if not self.save_from_ui():
@@ -411,14 +452,15 @@ class ScreenSaverSpecialApp:
 
     def start_monitoring(self) -> None:
         if self.monitoring:
+            self.log_message("A monitorozás már fut")
             return
         if not self.save_from_ui():
             return
         self.test_overlay_active = False
         self.stop_event.clear()
+        self.monitoring = True
         self.worker = threading.Thread(target=self._monitor_loop, daemon=True)
         self.worker.start()
-        self.monitoring = True
         self.log_message("Monitorozás elindítva")
 
     def stop_monitoring(self) -> None:
@@ -433,6 +475,9 @@ class ScreenSaverSpecialApp:
         previous_img: Optional[Image.Image] = None
         last_change_time = time.time()
         last_missing_log = 0.0
+        last_capture_fail_log = 0.0
+        last_wait_log = 0.0
+        overlay_logged = False
 
         while not self.stop_event.is_set():
             try:
@@ -444,9 +489,10 @@ class ScreenSaverSpecialApp:
                     hwnd = find_window_by_title_part(self.config.cashier_window_title_part)
                     previous_img = None
                     last_change_time = time.time()
+                    overlay_logged = False
                     if hwnd is None:
                         if time.time() - last_missing_log > 5:
-                            self.root.after(0, self.log_message, "Nem találom a kasszaprogram ablakát")
+                            self.root.after(0, self.log_message, "Nem találom a figyelt ablakot")
                             last_missing_log = time.time()
                         self.root.after(0, self.overlay.hide)
                         time.sleep(1)
@@ -454,8 +500,11 @@ class ScreenSaverSpecialApp:
                     title = win32gui.GetWindowText(hwnd)
                     self.root.after(0, self.log_message, f"Figyelt ablak: {title}")
 
-                current_img = capture_window(hwnd)
+                current_img = capture_window(hwnd, self.config.use_visible_screen_fallback)
                 if current_img is None:
+                    if time.time() - last_capture_fail_log > 5:
+                        self.root.after(0, self.log_message, "Capture sikertelen: nincs olvasható ablak-kép")
+                        last_capture_fail_log = time.time()
                     self.root.after(0, self.overlay.hide)
                     time.sleep(1)
                     continue
@@ -463,6 +512,7 @@ class ScreenSaverSpecialApp:
                 if previous_img is None:
                     previous_img = current_img
                     last_change_time = time.time()
+                    self.root.after(0, self.log_message, "Első képminta rögzítve, tétlenség mérése indul")
                     time.sleep(self.config.check_interval)
                     continue
 
@@ -470,11 +520,18 @@ class ScreenSaverSpecialApp:
                 if score > self.config.change_threshold:
                     previous_img = current_img
                     last_change_time = time.time()
+                    overlay_logged = False
                     self.root.after(0, self.overlay.hide)
                 else:
                     idle_time = time.time() - last_change_time
+                    if time.time() - last_wait_log > 10 and idle_time < self.config.idle_seconds:
+                        self.root.after(0, self.log_message, f"Tétlen: {idle_time:.0f}/{self.config.idle_seconds:.0f} mp")
+                        last_wait_log = time.time()
                     if idle_time >= self.config.idle_seconds:
                         self.root.after(0, self._safe_show_overlay)
+                        if not overlay_logged:
+                            self.root.after(0, self.log_message, "Tétlenségi idő letelt, kép megjelenítése")
+                            overlay_logged = True
 
                 if time.time() - last_change_time < self.config.visible_after_change_seconds:
                     self.root.after(0, self.overlay.hide)
@@ -485,6 +542,7 @@ class ScreenSaverSpecialApp:
                 self.root.after(0, self.overlay.hide)
                 time.sleep(2)
 
+        self.monitoring = False
         self.root.after(0, self.overlay.hide)
 
     def _safe_show_overlay(self) -> None:
