@@ -144,8 +144,6 @@ def capture_visible(hwnd: int) -> Optional[Image.Image]:
 
 
 def capture_window(hwnd: int, visible_first: bool) -> Tuple[Optional[Image.Image], str]:
-    # VirtualBox and some GPU-rendered apps return a valid but stale image through PrintWindow.
-    # When the checkbox is enabled, use the actually visible screen pixels first.
     if visible_first:
         image = capture_visible(hwnd)
         if image is not None:
@@ -256,6 +254,23 @@ class App:
         if self.config.auto_start_monitoring:
             self.root.after(500, self.start_monitoring)
 
+    def run_on_ui_thread(self, func, *args, timeout: float = 1.0) -> None:
+        done = threading.Event()
+        error = []
+
+        def wrapper():
+            try:
+                func(*args)
+            except Exception as exc:
+                error.append(exc)
+            finally:
+                done.set()
+
+        self.root.after(0, wrapper)
+        done.wait(timeout)
+        if error:
+            raise error[0]
+
     def build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
@@ -292,7 +307,7 @@ class App:
         self.visible_after_var = tk.StringVar()
         self.add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Teszteléshez állítsd 5-re.")
         self.add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "0.25 = kb. negyed másodperces reakció.")
-        self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Javasolt: 2-5. A log kiírja a mért értéket.")
+        self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Javasolt: 0.01-0.10 VirtualBox tesztnél, 2-5 valódi ablaknál.")
         self.add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Változás után legalább ennyi ideig maradjon látható a kassza.")
 
         options = ttk.LabelFrame(main, text="Indítás", padding=10)
@@ -478,6 +493,14 @@ class App:
             self.overlay_shown_at = time.time()
             self.ignore_first_overlay_change = True
 
+    def capture_for_monitoring(self, hwnd: int) -> Tuple[Optional[Image.Image], str]:
+        if self.overlay.visible and self.config.use_visible_screen_fallback:
+            self.run_on_ui_thread(self.overlay.hide)
+            time.sleep(0.08)
+            image, mode = capture_window(hwnd, True)
+            return image, f"{mode}-behind-overlay"
+        return capture_window(hwnd, self.config.use_visible_screen_fallback)
+
     def monitor_loop(self) -> None:
         hwnd: Optional[int] = None
         previous_img: Optional[Image.Image] = None
@@ -486,6 +509,7 @@ class App:
         last_capture_fail_log = 0.0
         last_wait_log = 0.0
         last_score_log = 0.0
+        last_overlay_sample_log = 0.0
         overlay_logged = False
 
         while not self.stop_event.is_set():
@@ -508,7 +532,8 @@ class App:
                         continue
                     self.root.after(0, self.log_message, f"Figyelt ablak: {win32gui.GetWindowText(hwnd)}")
 
-                current_img, mode = capture_window(hwnd, self.config.use_visible_screen_fallback)
+                was_overlay_visible = self.overlay.visible
+                current_img, mode = self.capture_for_monitoring(hwnd)
                 if current_img is None:
                     if time.time() - last_capture_fail_log > 5:
                         self.root.after(0, self.log_message, "Capture sikertelen: nincs olvasható ablak-kép")
@@ -530,23 +555,22 @@ class App:
                     last_score_log = time.time()
 
                 if score > self.config.change_threshold:
-                    if self.overlay.visible and self.ignore_first_overlay_change:
-                        previous_img = current_img
-                        self.ignore_first_overlay_change = False
-                        self.root.after(0, self.log_message, "Overlay miatti első képi változás figyelmen kívül hagyva")
-                    elif self.overlay.visible and time.time() - self.overlay_shown_at < 2.0:
-                        previous_img = current_img
-                    else:
-                        previous_img = current_img
-                        last_change_time = time.time()
-                        overlay_logged = False
-                        self.ignore_first_overlay_change = False
-                        self.root.after(0, self.overlay.hide)
+                    previous_img = current_img
+                    last_change_time = time.time()
+                    overlay_logged = False
+                    self.ignore_first_overlay_change = False
+                    self.root.after(0, self.overlay.hide)
                 else:
                     idle_time = time.time() - last_change_time
-                    if time.time() - last_wait_log > 10 and idle_time < self.config.idle_seconds:
+                    if was_overlay_visible:
+                        self.root.after(0, self.show_overlay_from_monitoring)
+                        if time.time() - last_overlay_sample_log > 10:
+                            self.root.after(0, self.log_message, "Overlay mögötti mintavétel: nincs változás, kép marad")
+                            last_overlay_sample_log = time.time()
+                    elif time.time() - last_wait_log > 10 and idle_time < self.config.idle_seconds:
                         self.root.after(0, self.log_message, f"Tétlen: {idle_time:.0f}/{self.config.idle_seconds:.0f} mp")
                         last_wait_log = time.time()
+
                     if idle_time >= self.config.idle_seconds:
                         self.root.after(0, self.show_overlay_from_monitoring)
                         if not overlay_logged:
