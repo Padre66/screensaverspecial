@@ -20,13 +20,18 @@ try:
 except Exception:
     serial = None
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 APP_TITLE = "ScreenSaver Special"
 CONFIG_FILE = Path("config.json")
 
 
 @dataclass
 class AppConfig:
-    monitor_mode: str = "window"  # window vagy serial
+    monitor_mode: str = "window"  # window / serial / process
     cashier_window_title_part: str = "Juta"
     screensaver_image: str = "C:/LaciABC/laci_abc_sotet_hatter.png"
     target_monitor_index: int = 0
@@ -42,6 +47,9 @@ class AppConfig:
     serial_bytesize: int = 8
     serial_parity: str = "N"
     serial_stopbits: float = 1.0
+    process_name: str = ""
+    process_cpu_threshold: float = 0.5
+    process_watch_io: bool = True
 
 
 def load_config() -> AppConfig:
@@ -77,6 +85,22 @@ def list_windows() -> List[Tuple[int, str]]:
     return result
 
 
+def list_processes() -> List[Tuple[int, str]]:
+    if psutil is None:
+        return []
+    result: List[Tuple[int, str]] = []
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            name = proc.info.get("name") or ""
+            pid = int(proc.info.get("pid"))
+            if name:
+                result.append((pid, name))
+        except Exception:
+            pass
+    result.sort(key=lambda item: item[1].lower())
+    return result
+
+
 def find_window_by_title_part(title_part: str) -> Optional[int]:
     title_part = title_part.lower().strip()
     if not title_part:
@@ -85,6 +109,24 @@ def find_window_by_title_part(title_part: str) -> Optional[int]:
         if title_part in title.lower():
             return hwnd
     return None
+
+
+def find_processes_by_name(name_part: str):
+    if psutil is None:
+        return []
+    name_part = name_part.lower().strip()
+    if not name_part:
+        return []
+    matches = []
+    for proc in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            exe = (proc.info.get("exe") or "").lower()
+            if name_part in name or name_part in exe:
+                matches.append(proc)
+        except Exception:
+            pass
+    return matches
 
 
 def capture_printwindow(hwnd: int) -> Optional[Image.Image]:
@@ -228,8 +270,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("900x780")
-        self.root.minsize(860, 720)
+        self.root.geometry("940x840")
+        self.root.minsize(900, 780)
         self.config = load_config()
         self.overlay = Overlay(root, self.on_overlay_manual_hide)
         self.stop_event = threading.Event()
@@ -237,12 +279,14 @@ class App:
         self.monitoring = False
         self.test_overlay_active = False
         self.window_items: List[Tuple[int, str]] = []
+        self.process_items: List[Tuple[int, str]] = []
         self.monitor_items = []
         self.status_var = tk.StringVar(value="Kész")
         self.build_ui()
         self.refresh_monitors()
         self.refresh_windows()
         self.refresh_serial_ports()
+        self.refresh_processes()
         self.load_values_to_ui()
         if self.config.start_minimized:
             self.root.iconify()
@@ -258,7 +302,8 @@ class App:
         mode_frame.pack(fill="x")
         self.mode_var = tk.StringVar()
         ttk.Radiobutton(mode_frame, text="Ablakkép figyelése", variable=self.mode_var, value="window").pack(side="left", padx=(0, 20))
-        ttk.Radiobutton(mode_frame, text="Soros port aktivitás figyelése", variable=self.mode_var, value="serial").pack(side="left")
+        ttk.Radiobutton(mode_frame, text="Soros port aktivitás figyelése", variable=self.mode_var, value="serial").pack(side="left", padx=(0, 20))
+        ttk.Radiobutton(mode_frame, text="Process aktivitás figyelése", variable=self.mode_var, value="process").pack(side="left")
 
         settings = ttk.LabelFrame(main, text="Ablakkép beállítások", padding=10)
         settings.pack(fill="x", pady=(10, 0))
@@ -274,6 +319,24 @@ class App:
         ttk.Checkbutton(settings, text="Látható képernyőrész figyelése elsődlegesen, amíg a logó nem látszik", variable=self.fallback_var).grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=4)
         settings.columnconfigure(1, weight=1)
 
+        process_frame = ttk.LabelFrame(main, text="Process aktivitás beállítások", padding=10)
+        process_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(process_frame, text="Process:").grid(row=0, column=0, sticky="w", pady=4)
+        self.process_combo = ttk.Combobox(process_frame, state="readonly", width=70)
+        self.process_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Button(process_frame, text="Process lista frissítése", command=self.refresh_processes).grid(row=0, column=2, padx=4)
+        ttk.Button(process_frame, text="Név átvétele", command=self.use_selected_process_name).grid(row=0, column=3, padx=4)
+        ttk.Label(process_frame, text="Process név részlete:").grid(row=1, column=0, sticky="w", pady=4)
+        self.process_name_var = tk.StringVar()
+        ttk.Entry(process_frame, textvariable=self.process_name_var).grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(process_frame, text="CPU küszöb %:").grid(row=1, column=2, sticky="e", pady=4)
+        self.process_cpu_threshold_var = tk.StringVar()
+        ttk.Entry(process_frame, textvariable=self.process_cpu_threshold_var, width=10).grid(row=1, column=3, sticky="w", padx=6, pady=4)
+        self.process_watch_io_var = tk.BooleanVar()
+        ttk.Checkbutton(process_frame, text="I/O aktivitás figyelése is", variable=self.process_watch_io_var).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(process_frame, text="Nem foglal COM portot; CPU vagy fájl/port I/O aktivitásra tünteti el a logót.").grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        process_frame.columnconfigure(1, weight=1)
+
         serial_frame = ttk.LabelFrame(main, text="Soros port beállítások", padding=10)
         serial_frame.pack(fill="x", pady=(10, 0))
         ttk.Label(serial_frame, text="COM port:").grid(row=0, column=0, sticky="w", pady=4)
@@ -281,8 +344,7 @@ class App:
         self.serial_port_combo = ttk.Combobox(serial_frame, textvariable=self.serial_port_var, width=20)
         self.serial_port_combo.grid(row=0, column=1, sticky="w", padx=6, pady=4)
         ttk.Button(serial_frame, text="Portok frissítése", command=self.refresh_serial_ports).grid(row=0, column=2, padx=4)
-        ttk.Label(serial_frame, text="Szabadon írható, pl. COM1, COM3, COM12").grid(row=0, column=3, sticky="w", padx=6)
-
+        ttk.Label(serial_frame, text="Szabadon írható, de közvetlen kassza COM portra nem ajánlott.").grid(row=0, column=3, sticky="w", padx=6)
         ttk.Label(serial_frame, text="Baud rate:").grid(row=1, column=0, sticky="w", pady=4)
         self.serial_baud_var = tk.StringVar()
         ttk.Combobox(serial_frame, textvariable=self.serial_baud_var, values=["1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"], width=18).grid(row=1, column=1, sticky="w", padx=6, pady=4)
@@ -295,7 +357,6 @@ class App:
         ttk.Label(serial_frame, text="Stopbit:").grid(row=2, column=2, sticky="e", pady=4)
         self.serial_stopbits_var = tk.StringVar()
         ttk.Combobox(serial_frame, textvariable=self.serial_stopbits_var, values=["1", "1.5", "2"], width=8).grid(row=2, column=3, sticky="w", padx=6, pady=4)
-        ttk.Label(serial_frame, text="Megjegyzés: Windows alatt egy COM portot általában csak egy program tud egyszerre megnyitni.").grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         image_frame = ttk.LabelFrame(main, text="Kép és monitor", padding=10)
         image_frame.pack(fill="x", pady=(10, 0))
@@ -315,10 +376,10 @@ class App:
         self.interval_var = tk.StringVar()
         self.threshold_var = tk.StringVar()
         self.visible_after_var = tk.StringVar()
-        self.add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Ennyi ideig nincs változás/adat, utána logó.")
-        self.add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "Soros portnál 0.1-0.5 ajánlott.")
+        self.add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Ennyi ideig nincs aktivitás, utána logó.")
+        self.add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "Process módban 0.5-1.0 ajánlott.")
         self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Csak ablakkép módban számít.")
-        self.add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Változás/adat után legalább ennyi ideig látszik a kassza.")
+        self.add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Aktivitás után legalább ennyi ideig látszik a kassza.")
 
         options = ttk.LabelFrame(main, text="Indítás", padding=10)
         options.pack(fill="x", pady=(10, 0))
@@ -334,6 +395,7 @@ class App:
         ttk.Button(buttons, text="Teszt kép elrejtése", command=self.hide_test_overlay).pack(side="left", padx=6)
         ttk.Button(buttons, text="Capture teszt", command=self.capture_test).pack(side="left", padx=6)
         ttk.Button(buttons, text="Soros port teszt", command=self.serial_test).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Process teszt", command=self.process_test).pack(side="left", padx=6)
         ttk.Button(buttons, text="Start monitorozás", command=self.start_monitoring).pack(side="right", padx=6)
         ttk.Button(buttons, text="Stop", command=self.stop_monitoring).pack(side="right", padx=6)
 
@@ -372,6 +434,9 @@ class App:
         self.serial_bytesize_var.set(str(self.config.serial_bytesize))
         self.serial_parity_var.set(self.config.serial_parity)
         self.serial_stopbits_var.set(str(self.config.serial_stopbits))
+        self.process_name_var.set(self.config.process_name)
+        self.process_cpu_threshold_var.set(str(self.config.process_cpu_threshold))
+        self.process_watch_io_var.set(self.config.process_watch_io)
         if self.monitor_items:
             self.monitor_combo.current(min(max(self.config.target_monitor_index, 0), len(self.monitor_items) - 1))
 
@@ -381,6 +446,14 @@ class App:
         if self.window_items:
             self.window_combo.current(0)
         self.log_message(f"Ablaklista frissítve: {len(self.window_items)} ablak")
+
+    def refresh_processes(self) -> None:
+        self.process_items = list_processes()
+        if hasattr(self, "process_combo"):
+            self.process_combo["values"] = [f"{name}  (PID: {pid})" for pid, name in self.process_items]
+            if self.process_items:
+                self.process_combo.current(0)
+        self.log_message(f"Process lista frissítve: {len(self.process_items)} process")
 
     def refresh_monitors(self) -> None:
         self.monitor_items = get_monitors()
@@ -402,6 +475,11 @@ class App:
         idx = self.window_combo.current()
         if 0 <= idx < len(self.window_items):
             self.title_part_var.set(self.window_items[idx][1])
+
+    def use_selected_process_name(self) -> None:
+        idx = self.process_combo.current()
+        if 0 <= idx < len(self.process_items):
+            self.process_name_var.set(self.process_items[idx][1])
 
     def browse_image(self) -> None:
         filename = filedialog.askopenfilename(title="Kijelzővédő kép kiválasztása", filetypes=[("Képfájlok", "*.png;*.jpg;*.jpeg;*.bmp;*.webp"), ("Minden fájl", "*.*")])
@@ -429,6 +507,9 @@ class App:
             serial_bytesize=int(float(self.serial_bytesize_var.get())),
             serial_parity=self.serial_parity_var.get().strip().upper() or "N",
             serial_stopbits=float(self.serial_stopbits_var.get()),
+            process_name=self.process_name_var.get().strip(),
+            process_cpu_threshold=float(self.process_cpu_threshold_var.get()),
+            process_watch_io=bool(self.process_watch_io_var.get()),
         )
 
     def save_from_ui(self) -> bool:
@@ -440,6 +521,8 @@ class App:
                 raise ValueError("Ablakkép módban az ablakcím részlete nem lehet üres.")
             if cfg.monitor_mode == "serial" and not cfg.serial_port:
                 raise ValueError("Soros port módban a COM port nem lehet üres.")
+            if cfg.monitor_mode == "process" and not cfg.process_name:
+                raise ValueError("Process módban a process név részlete nem lehet üres.")
             if cfg.idle_seconds < 1:
                 raise ValueError("A tétlenségi idő legyen legalább 1 másodperc.")
             if cfg.check_interval < 0.05:
@@ -481,17 +564,28 @@ class App:
             self.log_message("Soros port teszt sikertelen: pyserial nincs telepítve")
             return
         try:
-            with serial.Serial(
-                port=self.config.serial_port,
-                baudrate=self.config.serial_baudrate,
-                bytesize=self.config.serial_bytesize,
-                parity=self.config.serial_parity,
-                stopbits=self.config.serial_stopbits,
-                timeout=0.2,
-            ):
+            with serial.Serial(port=self.config.serial_port, baudrate=self.config.serial_baudrate, bytesize=self.config.serial_bytesize, parity=self.config.serial_parity, stopbits=self.config.serial_stopbits, timeout=0.2):
                 self.log_message(f"Soros port teszt sikeres: {self.config.serial_port}")
         except Exception as exc:
             self.log_message(f"Soros port teszt sikertelen: {exc}")
+
+    def process_test(self) -> None:
+        if not self.save_from_ui():
+            return
+        if psutil is None:
+            self.log_message("Process teszt sikertelen: psutil nincs telepítve")
+            return
+        matches = find_processes_by_name(self.config.process_name)
+        if not matches:
+            self.log_message("Process teszt: nincs találat")
+            return
+        names = []
+        for proc in matches[:5]:
+            try:
+                names.append(f"{proc.name()} PID:{proc.pid}")
+            except Exception:
+                pass
+        self.log_message(f"Process teszt sikeres: {len(matches)} találat; " + ", ".join(names))
 
     def test_show_overlay(self) -> None:
         if not self.save_from_ui():
@@ -523,7 +617,12 @@ class App:
         self.stop_event.clear()
         self.monitoring = True
         self.test_overlay_active = False
-        target = self.serial_loop if self.config.monitor_mode == "serial" else self.window_loop
+        if self.config.monitor_mode == "serial":
+            target = self.serial_loop
+        elif self.config.monitor_mode == "process":
+            target = self.process_loop
+        else:
+            target = self.window_loop
         self.worker = threading.Thread(target=target, daemon=True)
         self.worker.start()
         self.log_message(f"Monitorozás elindítva, mód: {self.config.monitor_mode}")
@@ -547,7 +646,6 @@ class App:
         last_wait_log = 0.0
         last_score_log = 0.0
         overlay_logged = False
-
         while not self.stop_event.is_set():
             try:
                 if self.test_overlay_active:
@@ -565,7 +663,6 @@ class App:
                         time.sleep(1)
                         continue
                     self.root.after(0, self.log_message, f"Figyelt ablak: {win32gui.GetWindowText(hwnd)}")
-
                 current_img, mode = capture_window(hwnd, self.config.use_visible_screen_fallback, self.overlay.visible)
                 if current_img is None:
                     if time.time() - last_capture_fail_log > 5:
@@ -579,12 +676,10 @@ class App:
                     self.root.after(0, self.log_message, f"Első képminta rögzítve, mód: {mode}")
                     time.sleep(self.config.check_interval)
                     continue
-
                 score = diff_score(previous_img, current_img)
                 if time.time() - last_score_log > 5:
                     self.root.after(0, self.log_message, f"Aktuális eltérés: {score:.2f}, küszöb: {self.config.change_threshold:.2f}, mód: {mode}")
                     last_score_log = time.time()
-
                 if score > self.config.change_threshold:
                     previous_img = current_img
                     last_change_time = time.time()
@@ -612,25 +707,16 @@ class App:
             self.root.after(0, self.log_message, "Soros port mód nem használható: pyserial nincs telepítve")
             self.monitoring = False
             return
-
         port = None
         last_activity = time.time()
         last_idle_log = 0.0
         overlay_logged = False
         reconnect_log = 0.0
-
         while not self.stop_event.is_set():
             try:
                 if port is None or not port.is_open:
                     try:
-                        port = serial.Serial(
-                            port=self.config.serial_port,
-                            baudrate=self.config.serial_baudrate,
-                            bytesize=self.config.serial_bytesize,
-                            parity=self.config.serial_parity,
-                            stopbits=self.config.serial_stopbits,
-                            timeout=0,
-                        )
+                        port = serial.Serial(port=self.config.serial_port, baudrate=self.config.serial_baudrate, bytesize=self.config.serial_bytesize, parity=self.config.serial_parity, stopbits=self.config.serial_stopbits, timeout=0)
                         self.root.after(0, self.log_message, f"Soros port megnyitva: {self.config.serial_port}")
                         last_activity = time.time()
                     except Exception as exc:
@@ -639,7 +725,6 @@ class App:
                             reconnect_log = time.time()
                         time.sleep(1)
                         continue
-
                 count = port.in_waiting
                 if count > 0:
                     data = port.read(count)
@@ -667,12 +752,101 @@ class App:
                     pass
                 port = None
                 time.sleep(1)
-
         try:
             if port is not None:
                 port.close()
         except Exception:
             pass
+        self.monitoring = False
+        self.root.after(0, self.overlay.hide)
+
+    def process_loop(self) -> None:
+        if psutil is None:
+            self.root.after(0, self.log_message, "Process mód nem használható: psutil nincs telepítve")
+            self.monitoring = False
+            return
+        watched = []
+        last_activity = time.time()
+        last_idle_log = 0.0
+        last_process_log = 0.0
+        last_metric_log = 0.0
+        overlay_logged = False
+        prev_io = {}
+        while not self.stop_event.is_set():
+            try:
+                alive = []
+                for proc in watched:
+                    try:
+                        if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                            alive.append(proc)
+                    except Exception:
+                        pass
+                watched = alive
+                if not watched:
+                    watched = find_processes_by_name(self.config.process_name)
+                    prev_io = {}
+                    for proc in watched:
+                        try:
+                            proc.cpu_percent(None)
+                            if self.config.process_watch_io:
+                                io = proc.io_counters()
+                                prev_io[proc.pid] = io.read_bytes + io.write_bytes + io.other_bytes
+                        except Exception:
+                            pass
+                    if watched:
+                        labels = []
+                        for proc in watched[:5]:
+                            try:
+                                labels.append(f"{proc.name()} PID:{proc.pid}")
+                            except Exception:
+                                pass
+                        self.root.after(0, self.log_message, "Figyelt process: " + ", ".join(labels))
+                        last_activity = time.time()
+                    else:
+                        if time.time() - last_process_log > 5:
+                            self.root.after(0, self.log_message, "Nem találom a figyelt process-t")
+                            last_process_log = time.time()
+                        time.sleep(1)
+                        continue
+
+                total_cpu = 0.0
+                io_changed = False
+                for proc in list(watched):
+                    try:
+                        total_cpu += proc.cpu_percent(None)
+                        if self.config.process_watch_io:
+                            io = proc.io_counters()
+                            total_io = io.read_bytes + io.write_bytes + io.other_bytes
+                            old_io = prev_io.get(proc.pid)
+                            if old_io is not None and total_io != old_io:
+                                io_changed = True
+                            prev_io[proc.pid] = total_io
+                    except Exception:
+                        pass
+
+                active = total_cpu >= self.config.process_cpu_threshold or io_changed
+                if time.time() - last_metric_log > 5:
+                    self.root.after(0, self.log_message, f"Process CPU: {total_cpu:.2f}% / küszöb: {self.config.process_cpu_threshold:.2f}%, I/O változás: {io_changed}")
+                    last_metric_log = time.time()
+
+                if active:
+                    last_activity = time.time()
+                    overlay_logged = False
+                    self.root.after(0, self.overlay.hide)
+                else:
+                    idle_time = time.time() - last_activity
+                    if not self.overlay.visible and time.time() - last_idle_log > 10 and idle_time < self.config.idle_seconds:
+                        self.root.after(0, self.log_message, f"Process tétlen: {idle_time:.0f}/{self.config.idle_seconds:.0f} mp")
+                        last_idle_log = time.time()
+                    if idle_time >= self.config.idle_seconds and not self.overlay.visible:
+                        self.root.after(0, self.show_overlay)
+                        if not overlay_logged:
+                            self.root.after(0, self.log_message, "Process tétlenségi idő letelt, kép megjelenítése")
+                            overlay_logged = True
+                time.sleep(self.config.check_interval)
+            except Exception as exc:
+                self.root.after(0, self.log_message, f"Process figyelési hiba: {exc}")
+                time.sleep(1)
         self.monitoring = False
         self.root.after(0, self.overlay.hide)
 
