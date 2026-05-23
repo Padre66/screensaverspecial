@@ -8,7 +8,7 @@ A program csak a kiválasztott kasszaprogram ablakát figyeli. Ha annak képe a 
 
 Ez azért hasznos, mert a másik monitoron futó mozgó böngészős reklám nem zavarja meg a működést.
 
-## Telepítés
+## Telepítés fejlesztői módban
 
 ```bat
 python -m venv .venv
@@ -16,11 +16,37 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Indítás
+## Indítás fejlesztői módban
 
 ```bat
 python screensaver_special.py
 ```
+
+## EXE készítése Windows alatt
+
+A repóban van egy egyszerű build script:
+
+```bat
+build_exe.bat
+```
+
+Ez létrehozza a virtuális környezetet, telepíti a függőségeket, majd elkészíti az EXE fájlt.
+
+Az elkészült fájl helye:
+
+```text
+dist\ScreenSaverSpecial.exe
+```
+
+## EXE készítése GitHub Actions-szel
+
+A repó tartalmaz egy workflow-t is:
+
+```text
+.github/workflows/build-windows-exe.yml
+```
+
+GitHubon az **Actions** fülön a **Build Windows EXE** workflow manuálisan is indítható a **Run workflow** gombbal. A kész EXE az artifactok között jelenik meg `ScreenSaverSpecial-windows-exe` néven.
 
 ## Beállítható a felületen
 
