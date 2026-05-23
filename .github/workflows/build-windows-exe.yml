@@ -26,8 +26,15 @@ jobs:
       - name: Build executable
         run: pyinstaller --noconfirm screensaverspecial.spec
 
+      - name: Prepare artifact folder
+        run: |
+          mkdir artifact
+          copy dist\ScreenSaverSpecial.exe artifact\ScreenSaverSpecial.exe
+          copy config.json artifact\config.json
+          copy config.example.json artifact\config.example.json
+
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ScreenSaverSpecial-windows-exe
-          path: dist/ScreenSaverSpecial.exe
+          name: ScreenSaverSpecial-windows-package
+          path: artifact/
