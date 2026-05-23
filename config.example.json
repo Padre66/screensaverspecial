@@ -1,0 +1,11 @@
+{
+  "cashier_window_title_part": "Juta",
+  "screensaver_image": "C:/LaciABC/laci_abc_sotet_hatter.png",
+  "target_monitor_index": 0,
+  "idle_seconds": 60,
+  "check_interval": 0.25,
+  "change_threshold": 3.0,
+  "visible_after_change_seconds": 2.0,
+  "start_minimized": false,
+  "auto_start_monitoring": false
+}
