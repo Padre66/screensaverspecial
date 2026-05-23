@@ -14,12 +14,19 @@ from screeninfo import get_monitors
 import win32gui
 import win32ui
 
+try:
+    import serial
+    import serial.tools.list_ports
+except Exception:
+    serial = None
+
 APP_TITLE = "ScreenSaver Special"
 CONFIG_FILE = Path("config.json")
 
 
 @dataclass
 class AppConfig:
+    monitor_mode: str = "window"  # window vagy serial
     cashier_window_title_part: str = "Juta"
     screensaver_image: str = "C:/LaciABC/laci_abc_sotet_hatter.png"
     target_monitor_index: int = 0
@@ -30,6 +37,11 @@ class AppConfig:
     start_minimized: bool = False
     auto_start_monitoring: bool = False
     use_visible_screen_fallback: bool = True
+    serial_port: str = "COM1"
+    serial_baudrate: int = 9600
+    serial_bytesize: int = 8
+    serial_parity: str = "N"
+    serial_stopbits: float = 1.0
 
 
 def load_config() -> AppConfig:
@@ -126,20 +138,15 @@ def capture_visible(hwnd: int) -> Optional[Image.Image]:
 
 
 def capture_window(hwnd: int, visible_first: bool, overlay_visible: bool) -> Tuple[Optional[Image.Image], str]:
-    # Important: when the logo is visible, do NOT use visible-screen capture.
-    # Otherwise the program only sees its own logo, not the cashier program.
-    # PrintWindow can read many normal Windows apps behind the overlay without flicker.
     if overlay_visible:
         img = capture_printwindow(hwnd)
         return img, "printwindow-behind-logo"
-
     if visible_first:
         img = capture_visible(hwnd)
         if img is not None:
             return img, "visible-screen"
         img = capture_printwindow(hwnd)
         return img, "printwindow-fallback"
-
     img = capture_printwindow(hwnd)
     if img is not None:
         return img, "printwindow"
@@ -221,8 +228,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("840x700")
-        self.root.minsize(800, 640)
+        self.root.geometry("900x780")
+        self.root.minsize(860, 720)
         self.config = load_config()
         self.overlay = Overlay(root, self.on_overlay_manual_hide)
         self.stop_event = threading.Event()
@@ -235,6 +242,7 @@ class App:
         self.build_ui()
         self.refresh_monitors()
         self.refresh_windows()
+        self.refresh_serial_ports()
         self.load_values_to_ui()
         if self.config.start_minimized:
             self.root.iconify()
@@ -246,48 +254,78 @@ class App:
         main.pack(fill="both", expand=True)
         ttk.Label(main, text="ScreenSaver Special - kassza kijelzővédő", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
 
-        settings = ttk.LabelFrame(main, text="Beállítások", padding=10)
-        settings.pack(fill="x")
+        mode_frame = ttk.LabelFrame(main, text="Figyelési mód", padding=10)
+        mode_frame.pack(fill="x")
+        self.mode_var = tk.StringVar()
+        ttk.Radiobutton(mode_frame, text="Ablakkép figyelése", variable=self.mode_var, value="window").pack(side="left", padx=(0, 20))
+        ttk.Radiobutton(mode_frame, text="Soros port aktivitás figyelése", variable=self.mode_var, value="serial").pack(side="left")
+
+        settings = ttk.LabelFrame(main, text="Ablakkép beállítások", padding=10)
+        settings.pack(fill="x", pady=(10, 0))
         ttk.Label(settings, text="Kasszaprogram ablaka:").grid(row=0, column=0, sticky="w", pady=4)
         self.window_combo = ttk.Combobox(settings, state="readonly", width=70)
         self.window_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
         ttk.Button(settings, text="Frissítés", command=self.refresh_windows).grid(row=0, column=2, padx=4)
         ttk.Button(settings, text="Cím átvétele", command=self.use_selected_window_title).grid(row=0, column=3, padx=4)
-
         ttk.Label(settings, text="Ablakcím részlete:").grid(row=1, column=0, sticky="w", pady=4)
         self.title_part_var = tk.StringVar()
         ttk.Entry(settings, textvariable=self.title_part_var).grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
-
-        ttk.Label(settings, text="Kijelzővédő kép:").grid(row=2, column=0, sticky="w", pady=4)
-        self.image_var = tk.StringVar()
-        ttk.Entry(settings, textvariable=self.image_var).grid(row=2, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
-        ttk.Button(settings, text="Tallózás", command=self.browse_image).grid(row=2, column=3, padx=4)
-
-        ttk.Label(settings, text="Cél monitor:").grid(row=3, column=0, sticky="w", pady=4)
-        self.monitor_combo = ttk.Combobox(settings, state="readonly", width=70)
-        self.monitor_combo.grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
-        ttk.Button(settings, text="Frissítés", command=self.refresh_monitors).grid(row=3, column=3, padx=4)
+        self.fallback_var = tk.BooleanVar()
+        ttk.Checkbutton(settings, text="Látható képernyőrész figyelése elsődlegesen, amíg a logó nem látszik", variable=self.fallback_var).grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=4)
         settings.columnconfigure(1, weight=1)
 
+        serial_frame = ttk.LabelFrame(main, text="Soros port beállítások", padding=10)
+        serial_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(serial_frame, text="COM port:").grid(row=0, column=0, sticky="w", pady=4)
+        self.serial_port_var = tk.StringVar()
+        self.serial_port_combo = ttk.Combobox(serial_frame, textvariable=self.serial_port_var, width=20)
+        self.serial_port_combo.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Button(serial_frame, text="Portok frissítése", command=self.refresh_serial_ports).grid(row=0, column=2, padx=4)
+        ttk.Label(serial_frame, text="Szabadon írható, pl. COM1, COM3, COM12").grid(row=0, column=3, sticky="w", padx=6)
+
+        ttk.Label(serial_frame, text="Baud rate:").grid(row=1, column=0, sticky="w", pady=4)
+        self.serial_baud_var = tk.StringVar()
+        ttk.Combobox(serial_frame, textvariable=self.serial_baud_var, values=["1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"], width=18).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(serial_frame, text="Adatbit:").grid(row=1, column=2, sticky="e", pady=4)
+        self.serial_bytesize_var = tk.StringVar()
+        ttk.Combobox(serial_frame, textvariable=self.serial_bytesize_var, values=["5", "6", "7", "8"], width=8).grid(row=1, column=3, sticky="w", padx=6, pady=4)
+        ttk.Label(serial_frame, text="Paritás:").grid(row=2, column=0, sticky="w", pady=4)
+        self.serial_parity_var = tk.StringVar()
+        ttk.Combobox(serial_frame, textvariable=self.serial_parity_var, values=["N", "E", "O", "M", "S"], width=8).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(serial_frame, text="Stopbit:").grid(row=2, column=2, sticky="e", pady=4)
+        self.serial_stopbits_var = tk.StringVar()
+        ttk.Combobox(serial_frame, textvariable=self.serial_stopbits_var, values=["1", "1.5", "2"], width=8).grid(row=2, column=3, sticky="w", padx=6, pady=4)
+        ttk.Label(serial_frame, text="Megjegyzés: Windows alatt egy COM portot általában csak egy program tud egyszerre megnyitni.").grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        image_frame = ttk.LabelFrame(main, text="Kép és monitor", padding=10)
+        image_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(image_frame, text="Kijelzővédő kép:").grid(row=0, column=0, sticky="w", pady=4)
+        self.image_var = tk.StringVar()
+        ttk.Entry(image_frame, textvariable=self.image_var).grid(row=0, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
+        ttk.Button(image_frame, text="Tallózás", command=self.browse_image).grid(row=0, column=3, padx=4)
+        ttk.Label(image_frame, text="Cél monitor:").grid(row=1, column=0, sticky="w", pady=4)
+        self.monitor_combo = ttk.Combobox(image_frame, state="readonly", width=70)
+        self.monitor_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
+        ttk.Button(image_frame, text="Frissítés", command=self.refresh_monitors).grid(row=1, column=3, padx=4)
+        image_frame.columnconfigure(1, weight=1)
+
         numeric = ttk.LabelFrame(main, text="Időzítés és érzékenység", padding=10)
-        numeric.pack(fill="x", pady=10)
+        numeric.pack(fill="x", pady=(10, 0))
         self.idle_var = tk.StringVar()
         self.interval_var = tk.StringVar()
         self.threshold_var = tk.StringVar()
         self.visible_after_var = tk.StringVar()
-        self.add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Teszteléshez állítsd 5-re.")
-        self.add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "0.5 vagy 1.0 ajánlott.")
-        self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "0.01-0.10 VirtualBox tesztnél, 2-5 valódi ablaknál.")
-        self.add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Változás után legalább ennyi ideig maradjon látható a kassza.")
+        self.add_number_row(numeric, 0, "Tétlenségi idő (mp):", self.idle_var, "Ennyi ideig nincs változás/adat, utána logó.")
+        self.add_number_row(numeric, 1, "Ellenőrzés gyakorisága (mp):", self.interval_var, "Soros portnál 0.1-0.5 ajánlott.")
+        self.add_number_row(numeric, 2, "Változásérzékenység:", self.threshold_var, "Csak ablakkép módban számít.")
+        self.add_number_row(numeric, 3, "Változás után látható idő (mp):", self.visible_after_var, "Változás/adat után legalább ennyi ideig látszik a kassza.")
 
         options = ttk.LabelFrame(main, text="Indítás", padding=10)
-        options.pack(fill="x")
+        options.pack(fill="x", pady=(10, 0))
         self.start_minimized_var = tk.BooleanVar()
         self.auto_start_var = tk.BooleanVar()
-        self.fallback_var = tk.BooleanVar()
         ttk.Checkbutton(options, text="Indításkor kis méretben induljon", variable=self.start_minimized_var).pack(anchor="w")
         ttk.Checkbutton(options, text="Program indításakor automatikusan induljon a figyelés", variable=self.auto_start_var).pack(anchor="w")
-        ttk.Checkbutton(options, text="Látható képernyőrész figyelése elsődlegesen, amíg a logó nem látszik", variable=self.fallback_var).pack(anchor="w")
 
         buttons = ttk.Frame(main)
         buttons.pack(fill="x", pady=12)
@@ -295,6 +333,7 @@ class App:
         ttk.Button(buttons, text="Teszt kép mutatása", command=self.test_show_overlay).pack(side="left", padx=6)
         ttk.Button(buttons, text="Teszt kép elrejtése", command=self.hide_test_overlay).pack(side="left", padx=6)
         ttk.Button(buttons, text="Capture teszt", command=self.capture_test).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Soros port teszt", command=self.serial_test).pack(side="left", padx=6)
         ttk.Button(buttons, text="Start monitorozás", command=self.start_monitoring).pack(side="right", padx=6)
         ttk.Button(buttons, text="Stop", command=self.stop_monitoring).pack(side="right", padx=6)
 
@@ -318,6 +357,7 @@ class App:
         self.status_var.set(message)
 
     def load_values_to_ui(self) -> None:
+        self.mode_var.set(self.config.monitor_mode)
         self.title_part_var.set(self.config.cashier_window_title_part)
         self.image_var.set(self.config.screensaver_image)
         self.idle_var.set(str(self.config.idle_seconds))
@@ -327,6 +367,11 @@ class App:
         self.start_minimized_var.set(self.config.start_minimized)
         self.auto_start_var.set(self.config.auto_start_monitoring)
         self.fallback_var.set(self.config.use_visible_screen_fallback)
+        self.serial_port_var.set(self.config.serial_port)
+        self.serial_baud_var.set(str(self.config.serial_baudrate))
+        self.serial_bytesize_var.set(str(self.config.serial_bytesize))
+        self.serial_parity_var.set(self.config.serial_parity)
+        self.serial_stopbits_var.set(str(self.config.serial_stopbits))
         if self.monitor_items:
             self.monitor_combo.current(min(max(self.config.target_monitor_index, 0), len(self.monitor_items) - 1))
 
@@ -344,6 +389,15 @@ class App:
             self.monitor_combo.current(min(max(int(self.config.target_monitor_index), 0), len(self.monitor_items) - 1))
         self.log_message(f"Monitorlista frissítve: {len(self.monitor_items)} monitor")
 
+    def refresh_serial_ports(self) -> None:
+        if serial is None:
+            self.log_message("pyserial nem elérhető")
+            return
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        if hasattr(self, "serial_port_combo"):
+            self.serial_port_combo["values"] = ports
+        self.log_message(f"Soros port lista frissítve: {len(ports)} port")
+
     def use_selected_window_title(self) -> None:
         idx = self.window_combo.current()
         if 0 <= idx < len(self.window_items):
@@ -359,6 +413,7 @@ class App:
         if monitor_index < 0:
             monitor_index = 0
         return AppConfig(
+            monitor_mode=self.mode_var.get().strip() or "window",
             cashier_window_title_part=self.title_part_var.get().strip(),
             screensaver_image=self.image_var.get().strip(),
             target_monitor_index=monitor_index,
@@ -369,15 +424,22 @@ class App:
             start_minimized=bool(self.start_minimized_var.get()),
             auto_start_monitoring=bool(self.auto_start_var.get()),
             use_visible_screen_fallback=bool(self.fallback_var.get()),
+            serial_port=self.serial_port_var.get().strip().upper(),
+            serial_baudrate=int(float(self.serial_baud_var.get())),
+            serial_bytesize=int(float(self.serial_bytesize_var.get())),
+            serial_parity=self.serial_parity_var.get().strip().upper() or "N",
+            serial_stopbits=float(self.serial_stopbits_var.get()),
         )
 
     def save_from_ui(self) -> bool:
         try:
             cfg = self.config_from_ui()
-            if not cfg.cashier_window_title_part:
-                raise ValueError("Az ablakcím részlete nem lehet üres.")
             if not Path(cfg.screensaver_image).exists():
                 raise ValueError("A kiválasztott kép nem található.")
+            if cfg.monitor_mode == "window" and not cfg.cashier_window_title_part:
+                raise ValueError("Ablakkép módban az ablakcím részlete nem lehet üres.")
+            if cfg.monitor_mode == "serial" and not cfg.serial_port:
+                raise ValueError("Soros port módban a COM port nem lehet üres.")
             if cfg.idle_seconds < 1:
                 raise ValueError("A tétlenségi idő legyen legalább 1 másodperc.")
             if cfg.check_interval < 0.05:
@@ -412,6 +474,25 @@ class App:
         else:
             self.log_message(f"Capture teszt sikeres: {img.width}x{img.height}, mód: {mode}")
 
+    def serial_test(self) -> None:
+        if not self.save_from_ui():
+            return
+        if serial is None:
+            self.log_message("Soros port teszt sikertelen: pyserial nincs telepítve")
+            return
+        try:
+            with serial.Serial(
+                port=self.config.serial_port,
+                baudrate=self.config.serial_baudrate,
+                bytesize=self.config.serial_bytesize,
+                parity=self.config.serial_parity,
+                stopbits=self.config.serial_stopbits,
+                timeout=0.2,
+            ):
+                self.log_message(f"Soros port teszt sikeres: {self.config.serial_port}")
+        except Exception as exc:
+            self.log_message(f"Soros port teszt sikertelen: {exc}")
+
     def test_show_overlay(self) -> None:
         if not self.save_from_ui():
             return
@@ -442,9 +523,10 @@ class App:
         self.stop_event.clear()
         self.monitoring = True
         self.test_overlay_active = False
-        self.worker = threading.Thread(target=self.monitor_loop, daemon=True)
+        target = self.serial_loop if self.config.monitor_mode == "serial" else self.window_loop
+        self.worker = threading.Thread(target=target, daemon=True)
         self.worker.start()
-        self.log_message("Monitorozás elindítva")
+        self.log_message(f"Monitorozás elindítva, mód: {self.config.monitor_mode}")
 
     def stop_monitoring(self) -> None:
         self.stop_event.set()
@@ -453,7 +535,10 @@ class App:
         self.overlay.hide()
         self.log_message("Monitorozás leállítva")
 
-    def monitor_loop(self) -> None:
+    def show_overlay(self) -> None:
+        self.overlay.show(self.config.screensaver_image, self.config.target_monitor_index)
+
+    def window_loop(self) -> None:
         hwnd: Optional[int] = None
         previous_img: Optional[Image.Image] = None
         last_change_time = time.time()
@@ -468,7 +553,6 @@ class App:
                 if self.test_overlay_active:
                     time.sleep(0.1)
                     continue
-
                 if hwnd is None or not win32gui.IsWindow(hwnd):
                     hwnd = find_window_by_title_part(self.config.cashier_window_title_part)
                     previous_img = None
@@ -478,7 +562,6 @@ class App:
                         if time.time() - last_missing_log > 5:
                             self.root.after(0, self.log_message, "Nem találom a figyelt ablakot")
                             last_missing_log = time.time()
-                        self.root.after(0, self.overlay.hide)
                         time.sleep(1)
                         continue
                     self.root.after(0, self.log_message, f"Figyelt ablak: {win32gui.GetWindowText(hwnd)}")
@@ -488,11 +571,8 @@ class App:
                     if time.time() - last_capture_fail_log > 5:
                         self.root.after(0, self.log_message, "Capture sikertelen: nincs olvasható ablak-kép")
                         last_capture_fail_log = time.time()
-                    if self.overlay.visible:
-                        self.root.after(0, self.log_message, "A logó mögötti változás nem olvasható villogásmentesen ennél az ablaknál")
                     time.sleep(1)
                     continue
-
                 if previous_img is None:
                     previous_img = current_img
                     last_change_time = time.time()
@@ -516,20 +596,83 @@ class App:
                         self.root.after(0, self.log_message, f"Tétlen: {idle_time:.0f}/{self.config.idle_seconds:.0f} mp")
                         last_wait_log = time.time()
                     if idle_time >= self.config.idle_seconds and not self.overlay.visible:
-                        self.root.after(0, self.overlay.show, self.config.screensaver_image, self.config.target_monitor_index)
+                        self.root.after(0, self.show_overlay)
                         if not overlay_logged:
                             self.root.after(0, self.log_message, "Tétlenségi idő letelt, kép megjelenítése")
                             overlay_logged = True
-
-                if not self.overlay.visible and time.time() - last_change_time < self.config.visible_after_change_seconds:
-                    self.root.after(0, self.overlay.hide)
-
                 time.sleep(self.config.check_interval)
             except Exception as exc:
                 self.root.after(0, self.log_message, f"Hiba: {exc}")
-                self.root.after(0, self.overlay.hide)
                 time.sleep(2)
+        self.monitoring = False
+        self.root.after(0, self.overlay.hide)
 
+    def serial_loop(self) -> None:
+        if serial is None:
+            self.root.after(0, self.log_message, "Soros port mód nem használható: pyserial nincs telepítve")
+            self.monitoring = False
+            return
+
+        port = None
+        last_activity = time.time()
+        last_idle_log = 0.0
+        overlay_logged = False
+        reconnect_log = 0.0
+
+        while not self.stop_event.is_set():
+            try:
+                if port is None or not port.is_open:
+                    try:
+                        port = serial.Serial(
+                            port=self.config.serial_port,
+                            baudrate=self.config.serial_baudrate,
+                            bytesize=self.config.serial_bytesize,
+                            parity=self.config.serial_parity,
+                            stopbits=self.config.serial_stopbits,
+                            timeout=0,
+                        )
+                        self.root.after(0, self.log_message, f"Soros port megnyitva: {self.config.serial_port}")
+                        last_activity = time.time()
+                    except Exception as exc:
+                        if time.time() - reconnect_log > 5:
+                            self.root.after(0, self.log_message, f"Soros port nem nyitható: {exc}")
+                            reconnect_log = time.time()
+                        time.sleep(1)
+                        continue
+
+                count = port.in_waiting
+                if count > 0:
+                    data = port.read(count)
+                    last_activity = time.time()
+                    overlay_logged = False
+                    self.root.after(0, self.overlay.hide)
+                    self.root.after(0, self.log_message, f"Soros adat érkezett: {len(data)} byte")
+                else:
+                    idle_time = time.time() - last_activity
+                    if not self.overlay.visible and time.time() - last_idle_log > 10 and idle_time < self.config.idle_seconds:
+                        self.root.after(0, self.log_message, f"Soros port tétlen: {idle_time:.0f}/{self.config.idle_seconds:.0f} mp")
+                        last_idle_log = time.time()
+                    if idle_time >= self.config.idle_seconds and not self.overlay.visible:
+                        self.root.after(0, self.show_overlay)
+                        if not overlay_logged:
+                            self.root.after(0, self.log_message, "Soros port tétlenségi idő letelt, kép megjelenítése")
+                            overlay_logged = True
+                time.sleep(self.config.check_interval)
+            except Exception as exc:
+                self.root.after(0, self.log_message, f"Soros port hiba: {exc}")
+                try:
+                    if port is not None:
+                        port.close()
+                except Exception:
+                    pass
+                port = None
+                time.sleep(1)
+
+        try:
+            if port is not None:
+                port.close()
+        except Exception:
+            pass
         self.monitoring = False
         self.root.after(0, self.overlay.hide)
 
